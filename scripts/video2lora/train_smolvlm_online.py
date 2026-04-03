@@ -65,7 +65,7 @@ class TrainArgs:
     n_latent_queries: int
     num_blocks: int
     num_self_attn_per_block: int
-    video_fps: float
+    video_fps: float | None
     max_frames: int
     wandb_project: str
     wandb_mode: str
@@ -119,7 +119,7 @@ def parse_args() -> TrainArgs:
     parser.add_argument("--n-latent-queries", type=int, default=128)
     parser.add_argument("--num-blocks", type=int, default=4)
     parser.add_argument("--num-self-attn-per-block", type=int, default=0)
-    parser.add_argument("--video-fps", type=float, default=1.0)
+    parser.add_argument("--video-fps", type=float, default=None)
     parser.add_argument("--max-frames", type=int, default=16)
     parser.add_argument("--wandb-project", default="video2lora")
     parser.add_argument(
@@ -415,15 +415,20 @@ def build_video2lora_model(args: TrainArgs, device: torch.device):
 
 
 def prepare_smolvlm_inputs(processor, video_messages, device, video_fps: float, max_frames: int):
+    chat_template_kwargs = dict(
+        max_frames=max_frames,
+        padding=True,
+    )
+    if video_fps is not None:
+        chat_template_kwargs["target_fps"] = video_fps
+
     vlm_inputs = processor.apply_chat_template(
         video_messages,
         add_generation_prompt=False,
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
-        padding=True,
-        video_fps=video_fps,
-        num_frames=max_frames,
+        **chat_template_kwargs,
     )
     moved = {}
     for key, value in vlm_inputs.items():

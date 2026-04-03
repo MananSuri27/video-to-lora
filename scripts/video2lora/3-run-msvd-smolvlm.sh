@@ -13,16 +13,22 @@ if [[ -z "${WANDB_API_KEY:-}" ]] && [[ -f "$WANDB_KEY_FILE" ]]; then
   WANDB_API_KEY="$(tr -d '[:space:]' < "$WANDB_KEY_FILE")"
 fi
 
-TRAIN_SAMPLES="${TRAIN_SAMPLES:-100}"
-VAL_SAMPLES="${VAL_SAMPLES:-20}"
+TRAIN_SAMPLES="${TRAIN_SAMPLES:-5000}"
+VAL_SAMPLES="${VAL_SAMPLES:-500}"
 SEED="${SEED:-42}"
 WANDB_PROJECT="${WANDB_PROJECT:-video2lora}"
 SMOLVLM_MODEL="${SMOLVLM_MODEL:-HuggingFaceTB/SmolVLM2-2.2B-Instruct}"
 BASE_LM_MODEL="${BASE_LM_MODEL:-HuggingFaceTB/SmolLM2-1.7B-Instruct}"
-VIDEO_FPS="${VIDEO_FPS:-1.0}"
+VIDEO_FPS="${VIDEO_FPS:-}"
 MAX_FRAMES="${MAX_FRAMES:-16}"
-BATCH_SIZE="${BATCH_SIZE:-4}"
-GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-2}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-8}"
+EPOCHS="${EPOCHS:-1}"
+LEARNING_RATE="${LEARNING_RATE:-1e-4}"
+WARMUP_STEPS="${WARMUP_STEPS:-200}"
+LOG_EVERY="${LOG_EVERY:-10}"
+EVAL_EVERY="${EVAL_EVERY:-100}"
+SAVE_EVERY="${SAVE_EVERY:-100}"
 
 uv run python scripts/video2lora/import_msvd_qa.py \
   --train-samples "$TRAIN_SAMPLES" \
@@ -31,13 +37,25 @@ uv run python scripts/video2lora/import_msvd_qa.py \
   --train-out /data/video2lora/processed/train.jsonl \
   --val-out /data/video2lora/processed/val.jsonl
 
-uv run python scripts/video2lora/train_smolvlm_online.py \
-  --smolvlm-name-or-path "$SMOLVLM_MODEL" \
-  --base-lm-name-or-path "$BASE_LM_MODEL" \
-  --train-manifest /data/video2lora/processed/train.jsonl \
-  --val-manifest /data/video2lora/processed/val.jsonl \
-  --batch-size "$BATCH_SIZE" \
-  --grad-accum-steps "$GRAD_ACCUM_STEPS" \
-  --video-fps "$VIDEO_FPS" \
-  --max-frames "$MAX_FRAMES" \
+train_args=(
+  --smolvlm-name-or-path "$SMOLVLM_MODEL"
+  --base-lm-name-or-path "$BASE_LM_MODEL"
+  --train-manifest /data/video2lora/processed/train.jsonl
+  --val-manifest /data/video2lora/processed/val.jsonl
+  --epochs "$EPOCHS"
+  --batch-size "$BATCH_SIZE"
+  --grad-accum-steps "$GRAD_ACCUM_STEPS"
+  --learning-rate "$LEARNING_RATE"
+  --warmup-steps "$WARMUP_STEPS"
+  --log-every "$LOG_EVERY"
+  --eval-every "$EVAL_EVERY"
+  --save-every "$SAVE_EVERY"
+  --max-frames "$MAX_FRAMES"
   --wandb-project "$WANDB_PROJECT"
+)
+
+if [[ -n "$VIDEO_FPS" ]]; then
+  train_args+=(--video-fps "$VIDEO_FPS")
+fi
+
+uv run python scripts/video2lora/train_smolvlm_online.py "${train_args[@]}"

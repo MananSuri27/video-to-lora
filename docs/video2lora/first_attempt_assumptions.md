@@ -157,3 +157,29 @@ Only after that should we spend serious time on:
 - better objectives
 - stronger evaluation
 - more faithful unified-VLM inference designs
+
+## Current Training Regime
+
+The current training path should now be treated as a `stage 1` setup:
+
+- single-chunk internalization only
+- no compositional chunk training yet
+- checkpoints from this phase are intended to seed a later `stage 2`
+
+For the current MSVD-QA prototype launcher, the intended defaults are:
+
+- `TRAIN_SAMPLES=5000`
+- `VAL_SAMPLES=500`
+- `BATCH_SIZE=16`
+- `GRAD_ACCUM_STEPS=8`
+- `MAX_FRAMES=16`
+- full target set:
+  - `q_proj`
+  - `k_proj`
+  - `v_proj`
+  - `o_proj`
+  - `gate_proj`
+  - `up_proj`
+  - `down_proj`
+
+This is explicitly meant to produce useful `stage 1` checkpoints that can later be resumed for chunk-composition training.
