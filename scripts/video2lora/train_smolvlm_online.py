@@ -46,6 +46,7 @@ class TrainArgs:
     epochs: int
     batch_size: int
     grad_accum_steps: int
+    max_steps: int | None
     learning_rate: float
     weight_decay: float
     warmup_steps: int
@@ -97,6 +98,7 @@ def parse_args() -> TrainArgs:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum-steps", type=int, default=4)
+    parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-steps", type=int, default=50)
@@ -149,6 +151,7 @@ def parse_args() -> TrainArgs:
         epochs=parsed.epochs,
         batch_size=parsed.batch_size,
         grad_accum_steps=parsed.grad_accum_steps,
+        max_steps=parsed.max_steps,
         learning_rate=parsed.learning_rate,
         weight_decay=parsed.weight_decay,
         warmup_steps=parsed.warmup_steps,
@@ -578,6 +581,9 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
         collate_fn=collator,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
     val_loader = None
     if val_rows:
@@ -587,6 +593,9 @@ def main():
             shuffle=False,
             num_workers=args.num_workers,
             collate_fn=collator,
+            pin_memory=True,
+            persistent_workers=args.num_workers > 0,
+            prefetch_factor=2 if args.num_workers > 0 else None,
         )
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -595,7 +604,11 @@ def main():
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
-    total_steps = math.ceil(len(train_loader) * args.epochs / args.grad_accum_steps)
+    total_steps = (
+        args.max_steps
+        if args.max_steps is not None
+        else math.ceil(len(train_loader) * args.epochs / args.grad_accum_steps)
+    )
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=args.warmup_steps,
@@ -619,6 +632,7 @@ def main():
 
     global_step = 0
     optimizer.zero_grad(set_to_none=True)
+    stop_training = False
     for epoch in range(args.epochs):
         for step, batch in enumerate(train_loader, start=1):
             text_batch = move_text_batch_to_device(batch, device)
@@ -684,6 +698,49 @@ def main():
                     ckpt_path = save_checkpoint(model, output_dir, global_step)
                     wandb.log({"checkpoint/step": global_step}, step=global_step)
                     print(f"Saved checkpoint to {ckpt_path}")
+
+                if args.max_steps is not None and global_step >= args.max_steps:
+                    stop_training = True
+                    break
+
+        if stop_training:
+            break
+
+        if step % args.grad_accum_steps != 0:
+            torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            global_step += 1
+
+            if global_step % args.log_every == 0:
+                wandb.log(
+                    {
+                        "train/loss": raw_loss.item(),
+                        "train/lr": scheduler.get_last_lr()[0],
+                        "train/epoch": epoch + 1,
+                        "train/step": global_step,
+                    },
+                    step=global_step,
+                )
+
+            if val_loader is not None and global_step % args.eval_every == 0:
+                metrics = evaluate(model, processor, vlm, val_loader, device)
+                wandb.log(
+                    {
+                        "val/loss": metrics["loss"],
+                        "val/ppl": metrics["ppl"],
+                    },
+                    step=global_step,
+                )
+
+            if global_step % args.save_every == 0:
+                ckpt_path = save_checkpoint(model, output_dir, global_step)
+                wandb.log({"checkpoint/step": global_step}, step=global_step)
+                print(f"Saved checkpoint to {ckpt_path}")
+
+        if args.max_steps is not None and global_step >= args.max_steps:
+            break
 
     final_ckpt = save_checkpoint(model, output_dir, global_step or 0)
     if val_loader is not None:

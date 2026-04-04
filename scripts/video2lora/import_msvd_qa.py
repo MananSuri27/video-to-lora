@@ -15,10 +15,20 @@ DATASET_ID = "morpheushoc/msvd-qa"
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Import a tiny MSVD-QA subset into the Video2LoRA manifest format."
+        description="Import MSVD-QA into the Video2LoRA manifest format."
     )
-    parser.add_argument("--train-samples", type=int, default=100)
-    parser.add_argument("--val-samples", type=int, default=20)
+    parser.add_argument(
+        "--train-samples",
+        type=int,
+        default=0,
+        help="Number of QA rows to keep. Use 0 or a negative value to keep the full train split.",
+    )
+    parser.add_argument(
+        "--val-samples",
+        type=int,
+        default=0,
+        help="Number of QA rows to keep. Use 0 or a negative value to keep the full val split.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--raw-video-dir",
@@ -138,14 +148,21 @@ def main():
     train_df = load_split("train")
     val_df = load_split("val")
 
-    train_examples = train_df.sample(
-        n=min(len(train_df), max(1, args.train_samples // 5)),
-        random_state=args.seed,
-    )
-    val_examples = val_df.sample(
-        n=min(len(val_df), max(1, args.val_samples // 5)),
-        random_state=args.seed,
-    )
+    if args.train_samples > 0:
+        train_examples = train_df.sample(
+            n=min(len(train_df), max(1, args.train_samples // 5)),
+            random_state=args.seed,
+        )
+    else:
+        train_examples = train_df
+
+    if args.val_samples > 0:
+        val_examples = val_df.sample(
+            n=min(len(val_df), max(1, args.val_samples // 5)),
+            random_state=args.seed,
+        )
+    else:
+        val_examples = val_df
 
     for _, row in pd.concat([train_examples, val_examples]).drop_duplicates(
         subset=["video_path"]
@@ -156,8 +173,10 @@ def main():
     val_rows = explode_rows(val_examples, split="val")
     random.shuffle(train_rows)
     random.shuffle(val_rows)
-    train_rows = train_rows[: args.train_samples]
-    val_rows = val_rows[: args.val_samples]
+    if args.train_samples > 0:
+        train_rows = train_rows[: args.train_samples]
+    if args.val_samples > 0:
+        val_rows = val_rows[: args.val_samples]
 
     dump_jsonl(Path(args.train_out), train_rows)
     dump_jsonl(Path(args.val_out), val_rows)
