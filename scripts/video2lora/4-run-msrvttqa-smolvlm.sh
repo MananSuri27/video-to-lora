@@ -2,10 +2,10 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
-echo "[gpu] 3-run using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
+echo "[gpu] 4-run using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-echo "[gpu] 3-run using PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
+echo "[gpu] 4-run using PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.2}"
 export PATH="$CUDA_HOME/bin:$PATH"
 NVIDIA_SITE_PKGS="$(pwd)/.venv/lib/python3.12/site-packages/nvidia"
@@ -17,6 +17,7 @@ if [[ -z "${WANDB_API_KEY:-}" ]] && [[ -f "$WANDB_KEY_FILE" ]]; then
   WANDB_API_KEY="$(tr -d '[:space:]' < "$WANDB_KEY_FILE")"
 fi
 
+DATASET_ROOT="${DATASET_ROOT:-/data/video2lora/raw/MSRVTT-QA}"
 TRAIN_SAMPLES="${TRAIN_SAMPLES:-0}"
 VAL_SAMPLES="${VAL_SAMPLES:-0}"
 SEED="${SEED:-42}"
@@ -29,7 +30,7 @@ BATCH_SIZE="${BATCH_SIZE:-16}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-18}"
 EPOCHS="${EPOCHS:-1000}"
-MAX_STEPS="${MAX_STEPS:-10000}"
+MAX_STEPS="${MAX_STEPS:-5000}"
 LEARNING_RATE="${LEARNING_RATE:-5e-5}"
 WARMUP_STEPS="${WARMUP_STEPS:-200}"
 LOG_EVERY="${LOG_EVERY:-10}"
@@ -42,21 +43,28 @@ LATENT_SIZE="${LATENT_SIZE:-768}"
 N_LATENT_QUERIES="${N_LATENT_QUERIES:-208}"
 NUM_BLOCKS="${NUM_BLOCKS:-6}"
 NUM_SELF_ATTN_PER_BLOCK="${NUM_SELF_ATTN_PER_BLOCK:-1}"
-WANDB_GROUP="${WANDB_GROUP:-msvd-qa}"
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-msvd-qa-smolvlm-r${LORA_R}-bs${BATCH_SIZE}}"
+WANDB_GROUP="${WANDB_GROUP:-msrvtt-qa}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-msrvtt-qa-smolvlm-r${LORA_R}-bs${BATCH_SIZE}}"
 
-uv run python scripts/video2lora/import_msvd_qa.py \
+TRAIN_MANIFEST="/data/video2lora/processed/msrvtt-qa-train.jsonl"
+VAL_MANIFEST="/data/video2lora/processed/msrvtt-qa-val.jsonl"
+
+uv run python scripts/video2lora/bootstrap_msrvtt_qa.py \
+  --dataset-root "$DATASET_ROOT"
+
+uv run python scripts/video2lora/import_msrvtt_qa.py \
+  --dataset-root "$DATASET_ROOT" \
   --train-samples "$TRAIN_SAMPLES" \
   --val-samples "$VAL_SAMPLES" \
   --seed "$SEED" \
-  --train-out /data/video2lora/processed/train.jsonl \
-  --val-out /data/video2lora/processed/val.jsonl
+  --train-out "$TRAIN_MANIFEST" \
+  --val-out "$VAL_MANIFEST"
 
 train_args=(
   --smolvlm-name-or-path "$SMOLVLM_MODEL"
   --base-lm-name-or-path "$BASE_LM_MODEL"
-  --train-manifest /data/video2lora/processed/train.jsonl
-  --val-manifest /data/video2lora/processed/val.jsonl
+  --train-manifest "$TRAIN_MANIFEST"
+  --val-manifest "$VAL_MANIFEST"
   --epochs "$EPOCHS"
   --max-steps "$MAX_STEPS"
   --batch-size "$BATCH_SIZE"

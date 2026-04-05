@@ -45,6 +45,7 @@ class TrainArgs:
     output_dir: str
     epochs: int
     batch_size: int
+    eval_batch_size: int
     grad_accum_steps: int
     max_steps: int | None
     learning_rate: float
@@ -70,6 +71,7 @@ class TrainArgs:
     max_frames: int
     wandb_project: str
     wandb_mode: str
+    wandb_group: str | None
     wandb_run_name: str | None
     wandb_notes: str | None
 
@@ -97,6 +99,7 @@ def parse_args() -> TrainArgs:
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--eval-batch-size", type=int, default=None)
     parser.add_argument("--grad-accum-steps", type=int, default=4)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
@@ -108,19 +111,19 @@ def parse_args() -> TrainArgs:
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--save-every", type=int, default=200)
     parser.add_argument("--max-train-samples", type=int, default=None)
-    parser.add_argument("--max-val-samples", type=int, default=200)
+    parser.add_argument("--max-val-samples", type=int, default=1000)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--lora-r", type=int, default=8)
+    parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-dropout", type=float, default=0.0)
     parser.add_argument(
         "--target-modules",
         default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
     )
-    parser.add_argument("--latent-size", type=int, default=512)
+    parser.add_argument("--latent-size", type=int, default=768)
     parser.add_argument("--dropout-rate", type=float, default=0.0)
-    parser.add_argument("--n-latent-queries", type=int, default=128)
-    parser.add_argument("--num-blocks", type=int, default=4)
-    parser.add_argument("--num-self-attn-per-block", type=int, default=0)
+    parser.add_argument("--n-latent-queries", type=int, default=208)
+    parser.add_argument("--num-blocks", type=int, default=6)
+    parser.add_argument("--num-self-attn-per-block", type=int, default=1)
     parser.add_argument("--video-fps", type=float, default=None)
     parser.add_argument("--max-frames", type=int, default=16)
     parser.add_argument("--wandb-project", default="video2lora")
@@ -129,6 +132,7 @@ def parse_args() -> TrainArgs:
         default="auto",
         choices=("auto", "online", "offline", "disabled"),
     )
+    parser.add_argument("--wandb-group", default=None)
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--wandb-notes", default=None)
     parsed = parser.parse_args()
@@ -150,6 +154,7 @@ def parse_args() -> TrainArgs:
         output_dir=output_dir,
         epochs=parsed.epochs,
         batch_size=parsed.batch_size,
+        eval_batch_size=parsed.eval_batch_size or parsed.batch_size,
         grad_accum_steps=parsed.grad_accum_steps,
         max_steps=parsed.max_steps,
         learning_rate=parsed.learning_rate,
@@ -175,6 +180,7 @@ def parse_args() -> TrainArgs:
         max_frames=parsed.max_frames,
         wandb_project=parsed.wandb_project,
         wandb_mode=parsed.wandb_mode,
+        wandb_group=parsed.wandb_group,
         wandb_run_name=parsed.wandb_run_name,
         wandb_notes=parsed.wandb_notes,
     )
@@ -351,7 +357,7 @@ def build_base_model(args: TrainArgs, device: torch.device):
         args.base_lm_name_or_path,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        device_map=device.type,
+        device_map={"": device.index if device.index is not None else 0},
     )
     from peft import PeftModel
 
@@ -376,7 +382,7 @@ def build_video2lora_model(args: TrainArgs, device: torch.device):
         args.smolvlm_name_or_path,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        device_map=device.type,
+        device_map={"": device.index if device.index is not None else 0},
     )
     vlm.eval()
     for param in vlm.parameters():
@@ -553,6 +559,16 @@ def resolve_wandb_mode(requested_mode: str) -> str:
     return "offline"
 
 
+def dataset_tag_from_manifest(manifest_path: str | None) -> str:
+    if not manifest_path:
+        return "unknown-dataset"
+    stem = Path(manifest_path).stem
+    for suffix in ("-train", "-val", "_train", "_val"):
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
+
+
 def main():
     args = parse_args()
     output_dir = Path(args.output_dir)
@@ -562,7 +578,17 @@ def main():
     if not os.path.exists(args.train_manifest):
         raise FileNotFoundError(f"Train manifest not found: {args.train_manifest}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(0)
+        device = torch.device("cuda:0")
+        print(
+            "[gpu] "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')} "
+            f"current_device={torch.cuda.current_device()} "
+            f"device_name={torch.cuda.get_device_name(torch.cuda.current_device())}"
+        )
+    else:
+        device = torch.device("cpu")
     train_rows = load_jsonl(args.train_manifest, args.max_train_samples)
     val_rows = (
         load_jsonl(args.val_manifest, args.max_val_samples) if args.val_manifest else []
@@ -589,7 +615,7 @@ def main():
     if val_rows:
         val_loader = DataLoader(
             VideoQADataset(val_rows),
-            batch_size=args.batch_size,
+            batch_size=args.eval_batch_size,
             shuffle=False,
             num_workers=args.num_workers,
             collate_fn=collator,
@@ -620,10 +646,19 @@ def main():
     if wandb_mode == "disabled":
         os.environ["WANDB_DISABLED"] = "true"
     print(f"Using wandb mode: {wandb_mode}")
+    dataset_tag = dataset_tag_from_manifest(args.train_manifest)
+    wandb_tags = [
+        dataset_tag,
+        f"base:{Path(args.base_lm_name_or_path).name}",
+        f"vlm:{Path(args.smolvlm_name_or_path).name}",
+        f"rank:{args.lora_r}",
+    ]
     wandb.init(
         project=args.wandb_project,
         name=run_name,
+        group=args.wandb_group,
         notes=args.wandb_notes,
+        tags=wandb_tags,
         config=asdict(args),
         mode=wandb_mode,
     )
