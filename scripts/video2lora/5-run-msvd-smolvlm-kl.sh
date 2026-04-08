@@ -2,10 +2,10 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
-echo "[gpu] 4-run using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+echo "[gpu] 5-run using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-echo "[gpu] 4-run using PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
+echo "[gpu] 5-run using PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
 if [[ -z "${CUDA_HOME:-}" || ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
   if [[ -x /usr/local/cuda/bin/nvcc ]]; then
     CUDA_HOME="$(readlink -f /usr/local/cuda)"
@@ -17,7 +17,7 @@ if [[ -z "${CUDA_HOME:-}" || ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
 fi
 export CUDA_HOME
 export PATH="$CUDA_HOME/bin:$PATH"
-echo "[gpu] 4-run using CUDA_HOME=${CUDA_HOME}"
+echo "[gpu] 5-run using CUDA_HOME=${CUDA_HOME}"
 NVIDIA_SITE_PKGS="$(pwd)/.venv/lib/python3.12/site-packages/nvidia"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$NVIDIA_SITE_PKGS/cublas/lib:$NVIDIA_SITE_PKGS/cuda_cupti/lib:$NVIDIA_SITE_PKGS/cuda_nvrtc/lib:$NVIDIA_SITE_PKGS/cuda_runtime/lib:$NVIDIA_SITE_PKGS/cudnn/lib:$NVIDIA_SITE_PKGS/cufft/lib:$NVIDIA_SITE_PKGS/curand/lib:$NVIDIA_SITE_PKGS/cusolver/lib:$NVIDIA_SITE_PKGS/cusparse/lib:$NVIDIA_SITE_PKGS/nccl/lib:$NVIDIA_SITE_PKGS/nvjitlink/lib:$NVIDIA_SITE_PKGS/nvtx/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="$(pwd)/src:${PYTHONPATH:-}"
@@ -27,43 +27,43 @@ if [[ -z "${WANDB_API_KEY:-}" ]] && [[ -f "$WANDB_KEY_FILE" ]]; then
   WANDB_API_KEY="$(tr -d '[:space:]' < "$WANDB_KEY_FILE")"
 fi
 
-DATASET_ROOT="${DATASET_ROOT:-/data/video2lora/raw/MSRVTT-QA}"
 TRAIN_SAMPLES="${TRAIN_SAMPLES:-0}"
 VAL_SAMPLES="${VAL_SAMPLES:-0}"
 SEED="${SEED:-42}"
-WANDB_PROJECT="${WANDB_PROJECT:-video2lora}"
+WANDB_PROJECT="${WANDB_PROJECT:-video2lora-video-centric}"
 SMOLVLM_MODEL="${SMOLVLM_MODEL:-HuggingFaceTB/SmolVLM2-2.2B-Instruct}"
 BASE_LM_MODEL="${BASE_LM_MODEL:-HuggingFaceTB/SmolLM2-1.7B-Instruct}"
 VIDEO_FPS="${VIDEO_FPS:-}"
 MAX_FRAMES="${MAX_FRAMES:-16}"
-BATCH_SIZE="${BATCH_SIZE:-16}"
-EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
-GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-18}"
+QUESTIONS_PER_VIDEO="${QUESTIONS_PER_VIDEO:-4}"
+FRAME_POOLING="${FRAME_POOLING:-mean}"
+BATCH_SIZE="${BATCH_SIZE:-20}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-2}"
 EPOCHS="${EPOCHS:-1000}"
 MAX_STEPS="${MAX_STEPS:-5000}"
-LEARNING_RATE="${LEARNING_RATE:-5e-5}"
+LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 WARMUP_STEPS="${WARMUP_STEPS:-200}"
 LOG_EVERY="${LOG_EVERY:-10}"
 EVAL_EVERY="${EVAL_EVERY:-250}"
 SAVE_EVERY="${SAVE_EVERY:-500}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-1000}"
-LORA_R="${LORA_R:-16}"
-LATENT_SIZE="${LATENT_SIZE:-768}"
+LORA_R="${LORA_R:-8}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj,down_proj}"
+LATENT_SIZE="${LATENT_SIZE:-512}"
 N_LATENT_QUERIES="${N_LATENT_QUERIES:-208}"
 NUM_BLOCKS="${NUM_BLOCKS:-6}"
 NUM_SELF_ATTN_PER_BLOCK="${NUM_SELF_ATTN_PER_BLOCK:-1}"
-WANDB_GROUP="${WANDB_GROUP:-msrvtt-qa}"
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-msrvtt-qa-smolvlm-r${LORA_R}-bs${BATCH_SIZE}}"
+KL_WEIGHT="${KL_WEIGHT:-0.5}"
+KL_TEMPERATURE="${KL_TEMPERATURE:-2.0}"
+WANDB_GROUP="${WANDB_GROUP:-msvd-qa-video-centric-kl}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-msvd-qa-kl-qpv${QUESTIONS_PER_VIDEO}-f${MAX_FRAMES}-r${LORA_R}-bs${BATCH_SIZE}}"
 
-TRAIN_MANIFEST="/data/video2lora/processed/msrvtt-qa-train.jsonl"
-VAL_MANIFEST="/data/video2lora/processed/msrvtt-qa-val.jsonl"
+TRAIN_MANIFEST="/data/video2lora/processed/msvd-qa-train.jsonl"
+VAL_MANIFEST="/data/video2lora/processed/msvd-qa-val.jsonl"
 
-uv run python scripts/video2lora/bootstrap_msrvtt_qa.py \
-  --dataset-root "$DATASET_ROOT"
-
-uv run python scripts/video2lora/import_msrvtt_qa.py \
-  --dataset-root "$DATASET_ROOT" \
+uv run python scripts/video2lora/import_msvd_qa.py \
   --train-samples "$TRAIN_SAMPLES" \
   --val-samples "$VAL_SAMPLES" \
   --seed "$SEED" \
@@ -88,11 +88,16 @@ train_args=(
   --save-every "$SAVE_EVERY"
   --max-val-samples "$MAX_VAL_SAMPLES"
   --lora-r "$LORA_R"
+  --target-modules "$TARGET_MODULES"
   --latent-size "$LATENT_SIZE"
   --n-latent-queries "$N_LATENT_QUERIES"
   --num-blocks "$NUM_BLOCKS"
   --num-self-attn-per-block "$NUM_SELF_ATTN_PER_BLOCK"
   --max-frames "$MAX_FRAMES"
+  --questions-per-video "$QUESTIONS_PER_VIDEO"
+  --frame-pooling "$FRAME_POOLING"
+  --kl-weight "$KL_WEIGHT"
+  --kl-temperature "$KL_TEMPERATURE"
   --wandb-project "$WANDB_PROJECT"
   --wandb-group "$WANDB_GROUP"
   --wandb-run-name "$WANDB_RUN_NAME"

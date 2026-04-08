@@ -5,9 +5,8 @@ import random
 from pathlib import Path
 
 import cv2
+from datasets import Dataset, load_dataset
 import numpy as np
-import pandas as pd
-from huggingface_hub import hf_hub_download, list_repo_files
 
 
 DATA_ROOT = Path("/data/video2lora")
@@ -67,31 +66,13 @@ def normalize_split_name(split: str) -> str:
     return split
 
 
-def list_split_files(dataset_name: str, split: str) -> list[str]:
-    normalized = normalize_split_name(split)
-    prefix = f"{dataset_name}/"
-    files = list_repo_files(DATASET_ID, repo_type="dataset")
-    candidates = [
-        f
-        for f in files
-        if f.startswith(prefix)
-        and normalized in Path(f).name
-        and f.endswith(".parquet")
-    ]
-    if not candidates:
-        raise FileNotFoundError(
-            f"No parquet files found for dataset={dataset_name!r} split={split!r} in {DATASET_ID}."
-        )
-    return sorted(candidates)
-
-
-def load_split(dataset_name: str, split: str) -> pd.DataFrame:
-    shard_paths = [
-        hf_hub_download(repo_id=DATASET_ID, repo_type="dataset", filename=filename)
-        for filename in list_split_files(dataset_name, split)
-    ]
-    frames = [pd.read_parquet(path) for path in shard_paths]
-    return pd.concat(frames, ignore_index=True)
+def load_split(dataset_name: str, split: str) -> Dataset:
+    return load_dataset(
+        DATASET_ID,
+        dataset_name,
+        split=normalize_split_name(split),
+        trust_remote_code=True,
+    )
 
 
 def decode_frame(frame_str: str) -> np.ndarray:
@@ -104,7 +85,7 @@ def decode_frame(frame_str: str) -> np.ndarray:
 
 
 def materialize_video(row, output_dir: Path, overwrite: bool, fps: float) -> Path:
-    sample_id = str(row.get("id", row.name))
+    sample_id = str(row.get("id", "sample"))
     output_path = output_dir / f"{sample_id}.mp4"
     if output_path.exists() and not overwrite:
         return output_path
@@ -135,16 +116,16 @@ def materialize_video(row, output_dir: Path, overwrite: bool, fps: float) -> Pat
     return output_path
 
 
-def assign_sample_ids(df: pd.DataFrame, split: str, dataset_name: str) -> pd.DataFrame:
-    df = df.reset_index(drop=True).copy()
-    df["sample_id"] = [f"{split}-{dataset_name}-{idx}" for idx in range(len(df))]
-    return df
+def sample_split(ds: Dataset, n_rows: int, seed: int) -> Dataset:
+    if n_rows <= 0 or n_rows >= len(ds):
+        return ds
+    return ds.shuffle(seed=seed).select(range(n_rows))
 
 
-def build_rows(df: pd.DataFrame, dataset_name: str, raw_dir_name: str) -> list[dict]:
+def build_rows(ds: Dataset, split: str, dataset_name: str, raw_dir_name: str) -> list[dict]:
     rows = []
-    for _, row in df.iterrows():
-        sample_id = row["sample_id"]
+    for idx, row in enumerate(ds):
+        sample_id = f"{split}-{dataset_name}-{idx}"
         rows.append(
             {
                 "id": sample_id,
@@ -177,28 +158,30 @@ def main():
     train_out = Path(args.train_out) if args.train_out else DATA_ROOT / "processed" / f"{dataset_slug}-train.jsonl"
     val_out = Path(args.val_out) if args.val_out else DATA_ROOT / "processed" / f"{dataset_slug}-val.jsonl"
 
-    train_df = load_split(args.dataset_name, "train")
-    val_df = load_split(args.dataset_name, "val")
+    train_df = sample_split(load_split(args.dataset_name, "train"), args.train_samples, args.seed)
+    val_df = sample_split(load_split(args.dataset_name, "val"), args.val_samples, args.seed)
 
-    if args.train_samples > 0:
-        train_df = train_df.sample(n=min(len(train_df), args.train_samples), random_state=args.seed)
-    if args.val_samples > 0:
-        val_df = val_df.sample(n=min(len(val_df), args.val_samples), random_state=args.seed)
-
-    train_df = assign_sample_ids(train_df, split="train", dataset_name=dataset_slug)
-    val_df = assign_sample_ids(val_df, split="val", dataset_name=dataset_slug)
-
-    for split_df in (train_df, val_df):
-        for row_idx, row in split_df.iterrows():
+    for split_name, split_df in (("train", train_df), ("val", val_df)):
+        for row_idx, row in enumerate(split_df):
             materialize_video(
-                row={"id": row["sample_id"], **row.to_dict()},
+                row={"id": f"{split_name}-{dataset_slug}-{row_idx}", **row},
                 output_dir=output_dir,
                 overwrite=args.overwrite_videos,
                 fps=args.fps,
             )
 
-    train_rows = build_rows(train_df, dataset_name=dataset_slug, raw_dir_name=raw_dir_name)
-    val_rows = build_rows(val_df, dataset_name=dataset_slug, raw_dir_name=raw_dir_name)
+    train_rows = build_rows(
+        train_df,
+        split="train",
+        dataset_name=dataset_slug,
+        raw_dir_name=raw_dir_name,
+    )
+    val_rows = build_rows(
+        val_df,
+        split="val",
+        dataset_name=dataset_slug,
+        raw_dir_name=raw_dir_name,
+    )
     random.shuffle(train_rows)
     random.shuffle(val_rows)
     dump_jsonl(train_out, train_rows)

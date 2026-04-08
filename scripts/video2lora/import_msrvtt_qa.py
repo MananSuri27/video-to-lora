@@ -31,11 +31,11 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--train-out",
-        default=str(DATA_ROOT / "processed" / "msrvtt-qa-train.jsonl"),
+        default=str(DATA_ROOT / "processed" / "msrvtt-qa-canonical-train.jsonl"),
     )
     parser.add_argument(
         "--val-out",
-        default=str(DATA_ROOT / "processed" / "msrvtt-qa-val.jsonl"),
+        default=str(DATA_ROOT / "processed" / "msrvtt-qa-canonical-val.jsonl"),
     )
     return parser.parse_args()
 

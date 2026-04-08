@@ -4,6 +4,8 @@ This folder now contains two prototype paths:
 
 - `import_msvd_qa.py`
   - downloads a small MSVD-QA subset, writes local `.mp4` files, and creates train/val manifests
+- `import_msrvtt_qa.py`
+  - imports canonical MSRVTT-QA annotations plus existing raw videos into train/val manifests
 - `0-import-msvd-qa.sh`
   - shell wrapper for importing a tiny MSVD-QA subset
 - `build_subset_manifest.py`
@@ -18,6 +20,12 @@ This folder now contains two prototype paths:
   - one-command subset-build + train runner
 - `3-run-msvd-smolvlm.sh`
   - one-command MSVD-QA import + train runner
+- `4-run-msrvttqa-smolvlm.sh`
+  - one-command canonical MSRVTT-QA bootstrap + import + train runner
+- `5-run-msvd-smolvlm-kl.sh`
+  - video-centric MSVD-QA runner with pooled frame tokens and KL loss
+- `6-run-msrvttqa-smolvlm-kl.sh`
+  - video-centric canonical MSRVTT-QA runner with pooled frame tokens and KL loss
 
 The online path is the preferred starting point because it matches the current D2L design more closely:
 
@@ -86,14 +94,41 @@ uv run python scripts/video2lora/train_smolvlm_online.py \
   --base-lm-name-or-path HuggingFaceTB/SmolLM2-1.7B-Instruct \
   --train-manifest /data/video2lora/processed/train.jsonl \
   --val-manifest /data/video2lora/processed/val.jsonl \
-  --batch-size 1 \
+  --batch-size 8 \
+  --eval-batch-size 4 \
   --grad-accum-steps 4 \
-  --video-fps 1.0 \
-  --max-frames 16 \
-  --wandb-project video2lora
+  --target-modules q_proj,v_proj,down_proj \
+  --latent-size 512 \
+  --questions-per-video 4 \
+  --frame-pooling mean \
+  --max-frames 24 \
+  --wandb-project video2lora-video-centric
 ```
 
 This script extracts video states online using SmolVLM's projected multimodal hidden states and feeds them directly into the D2L hypernet.
+
+Current recommendation for the PoC:
+
+- batch by videos, not single QA rows
+- sample multiple questions per video
+- mean-pool per-frame visual tokens before the perceiver
+- use a narrower target set such as `q_proj,v_proj,down_proj`
+
+For the current KL-based PoC launchers, use:
+
+- `bash scripts/video2lora/5-run-msvd-smolvlm-kl.sh`
+- `bash scripts/video2lora/6-run-msrvttqa-smolvlm-kl.sh`
+
+These KL launchers currently use:
+
+- a 16-frame budget
+- `4` questions per video
+- frame-token mean pooling
+- `q_proj,v_proj,down_proj`
+- `latent_size=512`
+- `batch_size=20`, `grad_accum_steps=2` for MSVD
+- `batch_size=20`, `grad_accum_steps=2` for canonical MSRVTT-QA
+- `eval_batch_size=16`
 
 ## One-Command Run
 
@@ -130,6 +165,27 @@ Useful overrides:
 ```bash
 TRAIN_SAMPLES=100 VAL_SAMPLES=20 WANDB_PROJECT=video2lora bash scripts/video2lora/3-run-msvd-smolvlm.sh
 ```
+
+## Canonical MSRVTT-QA Quick Start
+
+Download canonical annotations and videos:
+
+```bash
+uv run python scripts/video2lora/bootstrap_msrvtt_qa.py --include-test
+```
+
+Create manifests:
+
+```bash
+uv run python scripts/video2lora/import_msrvtt_qa.py
+```
+
+This writes:
+
+- `/data/video2lora/processed/msrvtt-qa-canonical-train.jsonl`
+- `/data/video2lora/processed/msrvtt-qa-canonical-val.jsonl`
+
+The canonical import uses explicit `-canonical-` manifest names so it can coexist with the smaller M3IT-backed `msrvtt-qa` manifests.
 
 ## Loss
 

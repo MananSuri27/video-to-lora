@@ -4,12 +4,14 @@ import math
 import os
 import random
 import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
 import wandb
+from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
@@ -69,6 +71,10 @@ class TrainArgs:
     num_self_attn_per_block: int
     video_fps: float | None
     max_frames: int
+    questions_per_video: int
+    frame_pooling: str
+    kl_weight: float
+    kl_temperature: float
     wandb_project: str
     wandb_mode: str
     wandb_group: str | None
@@ -117,16 +123,24 @@ def parse_args() -> TrainArgs:
     parser.add_argument("--lora-dropout", type=float, default=0.0)
     parser.add_argument(
         "--target-modules",
-        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+        default="q_proj,v_proj,down_proj",
     )
-    parser.add_argument("--latent-size", type=int, default=768)
+    parser.add_argument("--latent-size", type=int, default=512)
     parser.add_argument("--dropout-rate", type=float, default=0.0)
     parser.add_argument("--n-latent-queries", type=int, default=208)
     parser.add_argument("--num-blocks", type=int, default=6)
     parser.add_argument("--num-self-attn-per-block", type=int, default=1)
     parser.add_argument("--video-fps", type=float, default=None)
-    parser.add_argument("--max-frames", type=int, default=16)
-    parser.add_argument("--wandb-project", default="video2lora")
+    parser.add_argument("--max-frames", type=int, default=24)
+    parser.add_argument("--questions-per-video", type=int, default=4)
+    parser.add_argument(
+        "--frame-pooling",
+        default="mean",
+        choices=("mean", "flatten"),
+    )
+    parser.add_argument("--kl-weight", type=float, default=0.0)
+    parser.add_argument("--kl-temperature", type=float, default=1.0)
+    parser.add_argument("--wandb-project", default="video2lora-video-centric")
     parser.add_argument(
         "--wandb-mode",
         default="auto",
@@ -178,6 +192,10 @@ def parse_args() -> TrainArgs:
         num_self_attn_per_block=parsed.num_self_attn_per_block,
         video_fps=parsed.video_fps,
         max_frames=parsed.max_frames,
+        questions_per_video=parsed.questions_per_video,
+        frame_pooling=parsed.frame_pooling,
+        kl_weight=parsed.kl_weight,
+        kl_temperature=parsed.kl_temperature,
         wandb_project=parsed.wandb_project,
         wandb_mode=parsed.wandb_mode,
         wandb_group=parsed.wandb_group,
@@ -219,23 +237,57 @@ def load_jsonl(path: str, max_samples: int | None = None) -> list[dict[str, Any]
     return rows
 
 
+def resolve_video_path(video_path_str: str) -> str:
+    video_path = Path(video_path_str)
+    if not video_path.is_absolute():
+        video_path = DATA_ROOT / video_path
+    return str(video_path)
+
+
 class VideoQADataset(Dataset):
-    def __init__(self, rows: list[dict[str, Any]]):
-        self.rows = rows
+    def __init__(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        questions_per_video: int,
+        sample_questions_randomly: bool,
+    ):
+        grouped: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        for row in rows:
+            video_path = resolve_video_path(row["video_path"])
+            if video_path not in grouped:
+                grouped[video_path] = {
+                    "id": row.get("id", video_path),
+                    "video_path": video_path,
+                    "metadata": row.get("metadata", {}),
+                    "qas": [],
+                }
+            grouped[video_path]["qas"].append(
+                {
+                    "id": row.get("id"),
+                    "question": row["question"],
+                    "answer": row["answer"],
+                }
+            )
+        self.rows = list(grouped.values())
+        self.questions_per_video = questions_per_video
+        self.sample_questions_randomly = sample_questions_randomly
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         row = self.rows[idx]
-        video_path = Path(row["video_path"])
-        if not video_path.is_absolute():
-            video_path = DATA_ROOT / video_path
+        qas = row["qas"]
+        if 0 < self.questions_per_video < len(qas):
+            if self.sample_questions_randomly:
+                qas = random.sample(qas, k=self.questions_per_video)
+            else:
+                qas = qas[: self.questions_per_video]
         return {
             "id": row.get("id", str(idx)),
-            "video_path": str(video_path),
-            "question": row["question"],
-            "answer": row["answer"],
+            "video_path": row["video_path"],
+            "qas": qas,
             "metadata": row.get("metadata", {}),
         }
 
@@ -273,19 +325,17 @@ class SmolVLMOnlineCollator:
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         input_ids, attention_masks, labels = [], [], []
-        ids = []
+        qa_ids = []
+        video_ids = []
         video_messages = []
+        teacher_prompt_messages = []
+        teacher_full_messages = []
+        question_counts = []
 
         for example in batch:
-            inp_ids, attn_mask, lbl = build_labels(
-                self.base_tokenizer,
-                question=example["question"],
-                answer=example["answer"],
-            )
-            input_ids.append(inp_ids)
-            attention_masks.append(attn_mask)
-            labels.append(lbl)
-            ids.append(example["id"])
+            qas = example["qas"]
+            question_counts.append(len(qas))
+            video_ids.append(example["id"])
             video_messages.append(
                 [
                     {
@@ -300,6 +350,42 @@ class SmolVLMOnlineCollator:
                     }
                 ]
             )
+            for qa_idx, qa in enumerate(qas):
+                inp_ids, attn_mask, lbl = build_labels(
+                    self.base_tokenizer,
+                    question=qa["question"],
+                    answer=qa["answer"],
+                )
+                input_ids.append(inp_ids)
+                attention_masks.append(attn_mask)
+                labels.append(lbl)
+                qa_ids.append(qa.get("id") or f"{example['id']}-q{qa_idx}")
+                teacher_prompt_messages.append(
+                    [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "video", "path": example["video_path"]},
+                                {"type": "text", "text": qa["question"]},
+                            ],
+                        }
+                    ]
+                )
+                teacher_full_messages.append(
+                    [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "video", "path": example["video_path"]},
+                                {"type": "text", "text": qa["question"]},
+                            ],
+                        },
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": qa["answer"]}],
+                        },
+                    ]
+                )
 
         batch_input_ids = pad_sequence(
             input_ids,
@@ -318,11 +404,15 @@ class SmolVLMOnlineCollator:
         )
 
         return {
-            "ids": ids,
+            "ids": qa_ids,
+            "video_ids": video_ids,
+            "question_counts": torch.tensor(question_counts, dtype=torch.long),
             "input_ids": batch_input_ids,
             "attention_mask": batch_attention_mask,
             "labels": batch_labels,
             "video_messages": video_messages,
+            "teacher_prompt_messages": teacher_prompt_messages,
+            "teacher_full_messages": teacher_full_messages,
             "video_fps": self.video_fps,
             "max_frames": self.max_frames,
         }
@@ -451,8 +541,62 @@ def prepare_smolvlm_inputs(processor, video_messages, device, video_fps: float, 
     return moved
 
 
+def prepare_smolvlm_teacher_batch(
+    processor,
+    prompt_messages,
+    full_messages,
+    device,
+    video_fps: float,
+    max_frames: int,
+):
+    chat_template_kwargs = dict(
+        max_frames=max_frames,
+        padding=True,
+    )
+    if video_fps is not None:
+        chat_template_kwargs["target_fps"] = video_fps
+
+    prompt_inputs = processor.apply_chat_template(
+        prompt_messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        **chat_template_kwargs,
+    )
+    full_inputs = processor.apply_chat_template(
+        full_messages,
+        add_generation_prompt=False,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        **chat_template_kwargs,
+    )
+    labels = full_inputs["input_ids"].clone()
+    full_attention_mask = full_inputs.get("attention_mask")
+    prompt_attention_mask = prompt_inputs.get("attention_mask")
+    if full_attention_mask is None or prompt_attention_mask is None:
+        raise ValueError("Teacher SmolVLM inputs require attention masks.")
+    labels[full_attention_mask == 0] = -100
+    prompt_lens = prompt_attention_mask.sum(dim=1).tolist()
+    for row_idx, prompt_len in enumerate(prompt_lens):
+        labels[row_idx, :prompt_len] = -100
+
+    moved = {}
+    for key, value in full_inputs.items():
+        if isinstance(value, torch.Tensor):
+            if value.is_floating_point():
+                moved[key] = value.to(device=device, dtype=torch.bfloat16)
+            else:
+                moved[key] = value.to(device=device)
+        else:
+            moved[key] = value
+    moved["labels"] = labels.to(device=device)
+    return moved
+
+
 @torch.no_grad()
-def extract_video_features(vlm, vlm_inputs):
+def extract_video_features(vlm, vlm_inputs, frame_pooling: str):
     outputs = vlm.model(
         input_ids=vlm_inputs["input_ids"],
         attention_mask=vlm_inputs.get("attention_mask"),
@@ -486,12 +630,20 @@ def extract_video_features(vlm, vlm_inputs):
             f"vs image_hidden_states.shape[0]={ctx_features.shape[0]}."
         )
 
-    seq_len = ctx_features.shape[1]
     split_features = []
     offset = 0
     for n_units in valid_visual_units:
         sample_features = ctx_features[offset : offset + n_units]
-        split_features.append(sample_features.reshape(n_units * seq_len, ctx_features.shape[-1]))
+        if frame_pooling == "mean":
+            pooled_features = sample_features.mean(dim=1)
+        elif frame_pooling == "flatten":
+            pooled_features = sample_features.reshape(
+                n_units * sample_features.shape[1],
+                ctx_features.shape[-1],
+            )
+        else:
+            raise ValueError(f"Unsupported frame_pooling={frame_pooling!r}")
+        split_features.append(pooled_features)
         offset += n_units
 
     ctx_features = pad_sequence(split_features, batch_first=True, padding_value=0.0)
@@ -508,11 +660,124 @@ def extract_video_features(vlm, vlm_inputs):
     return ctx_features, ctx_attn_mask, ctx_position_ids
 
 
+def repeat_video_features_per_question(
+    ctx_features: torch.Tensor,
+    ctx_attn_mask: torch.Tensor,
+    ctx_position_ids: torch.Tensor,
+    question_counts: torch.Tensor,
+):
+    repeat_counts = question_counts.to(device=ctx_features.device, dtype=torch.long)
+    return (
+        ctx_features.repeat_interleave(repeat_counts, dim=0),
+        ctx_attn_mask.repeat_interleave(repeat_counts, dim=0),
+        ctx_position_ids.repeat_interleave(repeat_counts, dim=0),
+    )
+
+
+def compute_video_centric_ce_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    question_counts: torch.Tensor,
+):
+    shift_labels = nn.functional.pad(labels, (0, 1), value=-100)[..., 1:].contiguous()
+    vocab_size = logits.shape[-1]
+    token_losses = nn.functional.cross_entropy(
+        logits.float().view(-1, vocab_size),
+        shift_labels.view(-1),
+        reduction="none",
+    ).view(labels.shape[0], -1)
+    token_mask = shift_labels.ne(-100)
+    per_qa_loss = (token_losses * token_mask).sum(dim=1) / token_mask.sum(dim=1).clamp_min(1)
+    per_video_loss = torch.stack(
+        [
+            chunk.mean()
+            for chunk in torch.split(
+                per_qa_loss,
+                question_counts.detach().to("cpu", dtype=torch.long).tolist(),
+            )
+        ]
+    )
+    return per_video_loss.mean(), per_qa_loss, per_video_loss
+
+
+def compute_teacher_kl_loss(
+    student_logits: torch.Tensor,
+    student_labels: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    teacher_labels: torch.Tensor,
+    question_counts: torch.Tensor,
+    *,
+    temperature: float,
+):
+    shared_vocab_size = min(student_logits.shape[-1], teacher_logits.shape[-1])
+    student_shift_labels = nn.functional.pad(student_labels, (0, 1), value=-100)[
+        ..., 1:
+    ].contiguous()
+    teacher_shift_labels = nn.functional.pad(teacher_labels, (0, 1), value=-100)[
+        ..., 1:
+    ].contiguous()
+    student_shift_logits = student_logits[..., :shared_vocab_size]
+    teacher_shift_logits = teacher_logits[..., :shared_vocab_size]
+
+    per_qa_kl = []
+    for qa_idx in range(student_shift_logits.shape[0]):
+        student_mask = student_shift_labels[qa_idx].ne(-100)
+        teacher_mask = teacher_shift_labels[qa_idx].ne(-100)
+        student_qa_logits = student_shift_logits[qa_idx][student_mask]
+        teacher_qa_logits = teacher_shift_logits[qa_idx][teacher_mask]
+        if student_qa_logits.shape[0] == 0 or teacher_qa_logits.shape[0] == 0:
+            continue
+        if student_qa_logits.shape[0] != teacher_qa_logits.shape[0]:
+            min_len = min(student_qa_logits.shape[0], teacher_qa_logits.shape[0])
+            student_qa_logits = student_qa_logits[:min_len]
+            teacher_qa_logits = teacher_qa_logits[:min_len]
+        teacher_logp = nn.functional.log_softmax(
+            teacher_qa_logits.float() / temperature,
+            dim=-1,
+        )
+        student_logp = nn.functional.log_softmax(
+            student_qa_logits.float() / temperature,
+            dim=-1,
+        )
+        teacher_p = teacher_logp.exp()
+        kl_tokens = (teacher_p * (teacher_logp - student_logp)).sum(dim=-1)
+        per_qa_kl.append(kl_tokens.mean())
+
+    if not per_qa_kl:
+        zero = student_logits.new_zeros(())
+        return zero, zero.new_zeros((0,))
+
+    per_qa_kl = torch.stack(per_qa_kl)
+    per_video_kl = torch.stack(
+        [
+            chunk.mean()
+            for chunk in torch.split(
+                per_qa_kl,
+                question_counts.detach().to("cpu", dtype=torch.long).tolist(),
+            )
+        ]
+    )
+    return per_video_kl.mean() * (temperature**2), per_video_kl
+
+
 @torch.no_grad()
-def evaluate(model, processor, vlm, data_loader: DataLoader, device: torch.device) -> dict[str, float]:
+def evaluate(
+    model,
+    processor,
+    vlm,
+    data_loader: DataLoader,
+    device: torch.device,
+    frame_pooling: str,
+) -> dict[str, float]:
     model.eval()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     total_loss = 0.0
-    total_tokens = 0
+    total_videos = 0
+    total_questions = 0
+    total_batches = 0
+    total_answer_tokens = 0.0
+    total_context_tokens = 0.0
     for batch in data_loader:
         text_batch = move_text_batch_to_device(batch, device)
         vlm_inputs = prepare_smolvlm_inputs(
@@ -522,7 +787,17 @@ def evaluate(model, processor, vlm, data_loader: DataLoader, device: torch.devic
             video_fps=batch["video_fps"],
             max_frames=batch["max_frames"],
         )
-        ctx_features, ctx_attn_mask, ctx_position_ids = extract_video_features(vlm, vlm_inputs)
+        ctx_features, ctx_attn_mask, ctx_position_ids = extract_video_features(
+            vlm,
+            vlm_inputs,
+            frame_pooling=frame_pooling,
+        )
+        ctx_features, ctx_attn_mask, ctx_position_ids = repeat_video_features_per_question(
+            ctx_features,
+            ctx_attn_mask,
+            ctx_position_ids,
+            text_batch["question_counts"],
+        )
         outputs = model(
             ctx_features=ctx_features,
             ctx_attn_mask=ctx_attn_mask,
@@ -532,15 +807,44 @@ def evaluate(model, processor, vlm, data_loader: DataLoader, device: torch.devic
             attention_mask=text_batch["attention_mask"],
             labels=text_batch["labels"],
         )
-        labels = text_batch["labels"]
-        valid_tokens = (labels != -100).sum().item()
-        total_loss += outputs.loss.item() * valid_tokens
-        total_tokens += valid_tokens
+        raw_loss, _, _ = compute_video_centric_ce_loss(
+            outputs.logits,
+            text_batch["labels"],
+            text_batch["question_counts"],
+        )
+        num_videos = text_batch["question_counts"].numel()
+        num_questions = int(text_batch["question_counts"].sum().item())
+        total_loss += raw_loss.item() * num_videos
+        total_videos += num_videos
+        total_questions += num_questions
+        total_batches += 1
+        total_answer_tokens += float((text_batch["labels"] != -100).sum().item())
+        total_context_tokens += float(ctx_attn_mask.sum().item())
     model.train()
-    if total_tokens == 0:
-        return {"loss": float("nan"), "ppl": float("nan")}
-    mean_loss = total_loss / total_tokens
-    return {"loss": mean_loss, "ppl": math.exp(min(mean_loss, 20))}
+    if total_videos == 0:
+        return {
+            "loss": float("nan"),
+            "ppl": float("nan"),
+            "videos": 0.0,
+            "questions": 0.0,
+            "batches": 0.0,
+        }
+    mean_loss = total_loss / total_videos
+    metrics = {
+        "loss": mean_loss,
+        "ppl": math.exp(min(mean_loss, 20)),
+        "videos": float(total_videos),
+        "questions": float(total_questions),
+        "batches": float(total_batches),
+        "questions_per_video_mean": total_questions / max(total_videos, 1),
+        "answer_tokens_per_question_mean": total_answer_tokens / max(total_questions, 1),
+        "context_tokens_per_video_mean": total_context_tokens / max(total_videos, 1),
+    }
+    memory_metrics = get_peak_cuda_memory_metrics(device)
+    if memory_metrics:
+        metrics["memory_peak_allocated_gb"] = memory_metrics["memory/peak_allocated_gb"]
+        metrics["memory_peak_reserved_gb"] = memory_metrics["memory/peak_reserved_gb"]
+    return metrics
 
 
 def save_checkpoint(model, output_dir: Path, step: int) -> Path:
@@ -567,6 +871,15 @@ def dataset_tag_from_manifest(manifest_path: str | None) -> str:
         if stem.endswith(suffix):
             return stem[: -len(suffix)]
     return stem
+
+
+def get_peak_cuda_memory_metrics(device: torch.device) -> dict[str, float]:
+    if device.type != "cuda":
+        return {}
+    return {
+        "memory/peak_allocated_gb": torch.cuda.max_memory_allocated(device) / (1024**3),
+        "memory/peak_reserved_gb": torch.cuda.max_memory_reserved(device) / (1024**3),
+    }
 
 
 def main():
@@ -602,7 +915,11 @@ def main():
     )
 
     train_loader = DataLoader(
-        VideoQADataset(train_rows),
+        VideoQADataset(
+            train_rows,
+            questions_per_video=args.questions_per_video,
+            sample_questions_randomly=True,
+        ),
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
@@ -614,7 +931,11 @@ def main():
     val_loader = None
     if val_rows:
         val_loader = DataLoader(
-            VideoQADataset(val_rows),
+            VideoQADataset(
+                val_rows,
+                questions_per_video=args.questions_per_video,
+                sample_questions_randomly=False,
+            ),
             batch_size=args.eval_batch_size,
             shuffle=False,
             num_workers=args.num_workers,
@@ -652,6 +973,9 @@ def main():
         f"base:{Path(args.base_lm_name_or_path).name}",
         f"vlm:{Path(args.smolvlm_name_or_path).name}",
         f"rank:{args.lora_r}",
+        f"targets:{'-'.join(args.target_modules)}",
+        f"qpv:{args.questions_per_video}",
+        f"pool:{args.frame_pooling}",
     ]
     wandb.init(
         project=args.wandb_project,
@@ -664,13 +988,75 @@ def main():
     )
     with open(output_dir / "train_args.json", "w") as f:
         json.dump(asdict(args), f, indent=2)
+    dataset_metrics = {
+        "data/train_questions": float(len(train_rows)),
+        "data/train_videos": float(len(train_loader.dataset)),
+        "data/val_questions": float(len(val_rows)),
+        "data/val_videos": float(len(val_loader.dataset) if val_loader is not None else 0),
+        "data/questions_per_video_cap": float(args.questions_per_video),
+        "data/nominal_videos_per_optimizer_step": float(args.batch_size * args.grad_accum_steps),
+        "data/nominal_questions_per_optimizer_step": float(
+            args.batch_size * args.grad_accum_steps * args.questions_per_video
+        ),
+        "data/eval_videos_per_batch": float(args.eval_batch_size or 0),
+    }
+    wandb.log(dataset_metrics, step=0)
+    print(
+        "[data] "
+        f"train_videos={int(dataset_metrics['data/train_videos'])} "
+        f"train_questions={int(dataset_metrics['data/train_questions'])} "
+        f"val_videos={int(dataset_metrics['data/val_videos'])} "
+        f"val_questions={int(dataset_metrics['data/val_questions'])} "
+        f"nominal_videos_per_optimizer_step={int(dataset_metrics['data/nominal_videos_per_optimizer_step'])} "
+        f"nominal_questions_per_optimizer_step={int(dataset_metrics['data/nominal_questions_per_optimizer_step'])}"
+    )
+
+    def log_eval_metrics(metrics: dict[str, float], *, step: int, prefix: str) -> None:
+        payload = {
+            f"{prefix}/loss": metrics["loss"],
+            f"{prefix}/ppl": metrics["ppl"],
+            f"{prefix}/videos": metrics["videos"],
+            f"{prefix}/questions": metrics["questions"],
+            f"{prefix}/batches": metrics["batches"],
+            f"{prefix}/questions_per_video_mean": metrics.get("questions_per_video_mean", 0.0),
+            f"{prefix}/answer_tokens_per_question_mean": metrics.get(
+                "answer_tokens_per_question_mean", 0.0
+            ),
+            f"{prefix}/context_tokens_per_video_mean": metrics.get(
+                "context_tokens_per_video_mean", 0.0
+            ),
+            f"{prefix}/memory_peak_allocated_gb": metrics.get("memory_peak_allocated_gb", 0.0),
+            f"{prefix}/memory_peak_reserved_gb": metrics.get("memory_peak_reserved_gb", 0.0),
+        }
+        wandb.log(payload, step=step)
+        print(
+            f"[{prefix}] "
+            f"step={step} loss={metrics['loss']:.4f} "
+            f"videos={int(metrics['videos'])} "
+            f"questions={int(metrics['questions'])} "
+            f"peak_reserved_gb={metrics.get('memory_peak_reserved_gb', 0.0):.2f}"
+        )
 
     global_step = 0
     optimizer.zero_grad(set_to_none=True)
     stop_training = False
+    accumulated_videos = 0
+    accumulated_questions = 0
+    accumulated_microbatches = 0
+    accumulated_ce_loss = 0.0
+    accumulated_kl_loss = 0.0
+    accumulated_total_loss = 0.0
+    accumulated_per_video_loss = 0.0
+    accumulated_answer_tokens = 0.0
+    accumulated_context_tokens = 0.0
     for epoch in range(args.epochs):
         for step, batch in enumerate(train_loader, start=1):
+            if device.type == "cuda" and accumulated_microbatches == 0:
+                torch.cuda.reset_peak_memory_stats(device)
             text_batch = move_text_batch_to_device(batch, device)
+            question_counts_f = text_batch["question_counts"].to(dtype=torch.float32)
+            microbatch_videos = int(question_counts_f.numel())
+            microbatch_questions = int(question_counts_f.sum().item())
             vlm_inputs = prepare_smolvlm_inputs(
                 processor,
                 batch["video_messages"],
@@ -682,6 +1068,14 @@ def main():
                 ctx_features, ctx_attn_mask, ctx_position_ids = extract_video_features(
                     vlm,
                     vlm_inputs,
+                    frame_pooling=args.frame_pooling,
+                )
+                per_video_ctx_attn_mask = ctx_attn_mask
+                ctx_features, ctx_attn_mask, ctx_position_ids = repeat_video_features_per_question(
+                    ctx_features,
+                    ctx_attn_mask,
+                    ctx_position_ids,
+                    text_batch["question_counts"],
                 )
 
             outputs = model(
@@ -697,9 +1091,98 @@ def main():
                 attention_mask=text_batch["attention_mask"],
                 labels=text_batch["labels"],
             )
-            raw_loss = outputs.loss
-            loss = raw_loss / args.grad_accum_steps
+            raw_loss, _, per_video_loss = compute_video_centric_ce_loss(
+                outputs.logits,
+                text_batch["labels"],
+                text_batch["question_counts"],
+            )
+            kl_loss = outputs.logits.new_zeros(())
+            if args.kl_weight > 0:
+                with torch.no_grad():
+                    teacher_batch = prepare_smolvlm_teacher_batch(
+                        processor,
+                        batch["teacher_prompt_messages"],
+                        batch["teacher_full_messages"],
+                        device,
+                        video_fps=batch["video_fps"],
+                        max_frames=batch["max_frames"],
+                    )
+                    teacher_outputs = vlm(
+                        input_ids=teacher_batch["input_ids"],
+                        attention_mask=teacher_batch.get("attention_mask"),
+                        pixel_values=teacher_batch.get("pixel_values"),
+                        pixel_attention_mask=teacher_batch.get("pixel_attention_mask"),
+                        labels=None,
+                        return_dict=True,
+                        use_cache=False,
+                    )
+                kl_loss, _ = compute_teacher_kl_loss(
+                    outputs.logits,
+                    text_batch["labels"],
+                    teacher_outputs.logits,
+                    teacher_batch["labels"],
+                    text_batch["question_counts"],
+                    temperature=args.kl_temperature,
+                )
+            total_loss = raw_loss + args.kl_weight * kl_loss
+            loss = total_loss / args.grad_accum_steps
             loss.backward()
+
+            accumulated_videos += microbatch_videos
+            accumulated_questions += microbatch_questions
+            accumulated_microbatches += 1
+            accumulated_ce_loss += raw_loss.item()
+            accumulated_kl_loss += kl_loss.item() if args.kl_weight > 0 else 0.0
+            accumulated_total_loss += total_loss.item()
+            accumulated_per_video_loss += per_video_loss.mean().item()
+            accumulated_answer_tokens += float((text_batch["labels"] != -100).sum().item())
+            accumulated_context_tokens += float(per_video_ctx_attn_mask.sum().item())
+
+            question_counts_min = question_counts_f.min().item()
+            question_counts_max = question_counts_f.max().item()
+            question_counts_mean = question_counts_f.mean().item()
+
+            def log_train_metrics(epoch_value: float) -> None:
+                memory_metrics = get_peak_cuda_memory_metrics(device)
+                avg_den = max(accumulated_microbatches, 1)
+                metrics = {
+                    "train/loss": accumulated_total_loss / avg_den,
+                    "train/ce_loss": accumulated_ce_loss / avg_den,
+                    "train/total_loss": accumulated_total_loss / avg_den,
+                    "train/kl_loss": accumulated_kl_loss / avg_den,
+                    "train/weighted_kl_loss": args.kl_weight * (accumulated_kl_loss / avg_den),
+                    "train/per_video_loss": accumulated_per_video_loss / avg_den,
+                    "train/videos_per_microbatch": float(microbatch_videos),
+                    "train/questions_per_microbatch": float(microbatch_questions),
+                    "train/questions_per_video_mean": question_counts_mean,
+                    "train/questions_per_video_min": question_counts_min,
+                    "train/questions_per_video_max": question_counts_max,
+                    "train/answer_tokens_per_question_mean": accumulated_answer_tokens
+                    / max(accumulated_questions, 1),
+                    "train/context_tokens_per_video_mean": accumulated_context_tokens
+                    / max(accumulated_videos, 1),
+                    "train/microbatches_per_optimizer_step": float(accumulated_microbatches),
+                    "train/videos_per_optimizer_step": float(accumulated_videos),
+                    "train/questions_per_optimizer_step": float(accumulated_questions),
+                    "train/lr": scheduler.get_last_lr()[0],
+                    "train/epoch": epoch_value,
+                    "train/step": global_step,
+                    **memory_metrics,
+                }
+                wandb.log(metrics, step=global_step)
+                if memory_metrics:
+                    print(
+                        "[train] "
+                        f"step={global_step} total_loss={metrics['train/total_loss']:.4f} "
+                        f"ce={metrics['train/ce_loss']:.4f} "
+                        f"kl={metrics['train/kl_loss']:.4f} "
+                        f"videos={microbatch_videos} "
+                        f"questions={microbatch_questions} "
+                        f"opt_videos={accumulated_videos} "
+                        f"opt_questions={accumulated_questions} "
+                        f"ctx_tokens_per_video={metrics['train/context_tokens_per_video_mean']:.2f} "
+                        f"peak_reserved_gb={memory_metrics['memory/peak_reserved_gb']:.2f}"
+                    )
 
             if step % args.grad_accum_steps == 0:
                 torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
@@ -709,30 +1192,33 @@ def main():
                 global_step += 1
 
                 if global_step % args.log_every == 0:
-                    wandb.log(
-                        {
-                            "train/loss": raw_loss.item(),
-                            "train/lr": scheduler.get_last_lr()[0],
-                            "train/epoch": epoch + (step / max(len(train_loader), 1)),
-                            "train/step": global_step,
-                        },
-                        step=global_step,
-                    )
+                    log_train_metrics(epoch + (step / max(len(train_loader), 1)))
 
                 if val_loader is not None and global_step % args.eval_every == 0:
-                    metrics = evaluate(model, processor, vlm, val_loader, device)
-                    wandb.log(
-                        {
-                            "val/loss": metrics["loss"],
-                            "val/ppl": metrics["ppl"],
-                        },
-                        step=global_step,
+                    metrics = evaluate(
+                        model,
+                        processor,
+                        vlm,
+                        val_loader,
+                        device,
+                        frame_pooling=args.frame_pooling,
                     )
+                    log_eval_metrics(metrics, step=global_step, prefix="val")
 
                 if global_step % args.save_every == 0:
                     ckpt_path = save_checkpoint(model, output_dir, global_step)
                     wandb.log({"checkpoint/step": global_step}, step=global_step)
                     print(f"Saved checkpoint to {ckpt_path}")
+
+                accumulated_videos = 0
+                accumulated_questions = 0
+                accumulated_microbatches = 0
+                accumulated_ce_loss = 0.0
+                accumulated_kl_loss = 0.0
+                accumulated_total_loss = 0.0
+                accumulated_per_video_loss = 0.0
+                accumulated_answer_tokens = 0.0
+                accumulated_context_tokens = 0.0
 
                 if args.max_steps is not None and global_step >= args.max_steps:
                     stop_training = True
@@ -749,44 +1235,48 @@ def main():
             global_step += 1
 
             if global_step % args.log_every == 0:
-                wandb.log(
-                    {
-                        "train/loss": raw_loss.item(),
-                        "train/lr": scheduler.get_last_lr()[0],
-                        "train/epoch": epoch + 1,
-                        "train/step": global_step,
-                    },
-                    step=global_step,
-                )
+                log_train_metrics(epoch + 1)
 
             if val_loader is not None and global_step % args.eval_every == 0:
-                metrics = evaluate(model, processor, vlm, val_loader, device)
-                wandb.log(
-                    {
-                        "val/loss": metrics["loss"],
-                        "val/ppl": metrics["ppl"],
-                    },
-                    step=global_step,
+                metrics = evaluate(
+                    model,
+                    processor,
+                    vlm,
+                    val_loader,
+                    device,
+                    frame_pooling=args.frame_pooling,
                 )
+                log_eval_metrics(metrics, step=global_step, prefix="val")
 
             if global_step % args.save_every == 0:
                 ckpt_path = save_checkpoint(model, output_dir, global_step)
                 wandb.log({"checkpoint/step": global_step}, step=global_step)
                 print(f"Saved checkpoint to {ckpt_path}")
 
+            accumulated_videos = 0
+            accumulated_questions = 0
+            accumulated_microbatches = 0
+            accumulated_ce_loss = 0.0
+            accumulated_kl_loss = 0.0
+            accumulated_total_loss = 0.0
+            accumulated_per_video_loss = 0.0
+            accumulated_answer_tokens = 0.0
+            accumulated_context_tokens = 0.0
+
         if args.max_steps is not None and global_step >= args.max_steps:
             break
 
     final_ckpt = save_checkpoint(model, output_dir, global_step or 0)
     if val_loader is not None:
-        metrics = evaluate(model, processor, vlm, val_loader, device)
-        wandb.log(
-            {
-                "val/final_loss": metrics["loss"],
-                "val/final_ppl": metrics["ppl"],
-            },
-            step=max(global_step, 1),
+        metrics = evaluate(
+            model,
+            processor,
+            vlm,
+            val_loader,
+            device,
+            frame_pooling=args.frame_pooling,
         )
+        log_eval_metrics(metrics, step=max(global_step, 1), prefix="val/final")
     wandb.finish()
     print(f"Training finished. Final checkpoint: {final_ckpt}")
 

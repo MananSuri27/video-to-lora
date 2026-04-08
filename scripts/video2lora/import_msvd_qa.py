@@ -4,9 +4,8 @@ import random
 from pathlib import Path
 
 import cv2
+from datasets import Dataset, load_dataset
 import numpy as np
-import pandas as pd
-from huggingface_hub import hf_hub_download, list_repo_files
 
 
 DATA_ROOT = Path("/data/video2lora")
@@ -46,19 +45,18 @@ def parse_args():
     return parser.parse_args()
 
 
-def list_split_files(split: str) -> list[str]:
-    files = list_repo_files(DATASET_ID, repo_type="dataset")
-    prefix = f"data/{split}-"
-    return sorted([f for f in files if f.startswith(prefix) and f.endswith(".parquet")])
+def load_split(split: str) -> Dataset:
+    return load_dataset(DATASET_ID, split=split)
 
 
-def load_split(split: str) -> pd.DataFrame:
-    shard_paths = [
-        hf_hub_download(repo_id=DATASET_ID, repo_type="dataset", filename=filename)
-        for filename in list_split_files(split)
-    ]
-    frames = [pd.read_parquet(path) for path in shard_paths]
-    return pd.concat(frames, ignore_index=True)
+def sample_examples(ds: Dataset, n_qa_rows: int, seed: int) -> Dataset:
+    if n_qa_rows <= 0:
+        return ds
+    # MSVD-QA has about five QA pairs per source video, so sample videos first.
+    n_video_rows = min(len(ds), max(1, n_qa_rows // 5))
+    rng = random.Random(seed)
+    indices = sorted(rng.sample(range(len(ds)), k=n_video_rows))
+    return ds.select(indices)
 
 
 def video_rel_path(source_path: str) -> str:
@@ -109,9 +107,9 @@ def materialize_video(
     return output_path
 
 
-def explode_rows(df: pd.DataFrame, split: str) -> list[dict]:
+def explode_rows(ds: Dataset, split: str) -> list[dict]:
     rows = []
-    for _, row in df.iterrows():
+    for row in ds:
         rel_video_path = video_rel_path(row["video_path"])
         for qa_idx, qa_pair in enumerate(row["qa"]):
             if len(qa_pair) < 2:
@@ -148,25 +146,16 @@ def main():
     train_df = load_split("train")
     val_df = load_split("val")
 
-    if args.train_samples > 0:
-        train_examples = train_df.sample(
-            n=min(len(train_df), max(1, args.train_samples // 5)),
-            random_state=args.seed,
-        )
-    else:
-        train_examples = train_df
+    train_examples = sample_examples(train_df, args.train_samples, args.seed)
+    val_examples = sample_examples(val_df, args.val_samples, args.seed)
 
-    if args.val_samples > 0:
-        val_examples = val_df.sample(
-            n=min(len(val_df), max(1, args.val_samples // 5)),
-            random_state=args.seed,
-        )
-    else:
-        val_examples = val_df
+    rows_to_materialize: dict[str, dict] = {}
+    for row in train_examples:
+        rows_to_materialize[row["video_path"]] = row
+    for row in val_examples:
+        rows_to_materialize[row["video_path"]] = row
 
-    for _, row in pd.concat([train_examples, val_examples]).drop_duplicates(
-        subset=["video_path"]
-    ).iterrows():
+    for row in rows_to_materialize.values():
         materialize_video(row, output_dir, overwrite=args.overwrite_videos)
 
     train_rows = explode_rows(train_examples, split="train")
