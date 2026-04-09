@@ -4,6 +4,7 @@
 
 - [Video2LoRA Musings (2026-04-07)](musings_2026-04-07.md)
 - [Video2LoRA Datasets And Research Notes (2026-04-07)](datasets_and_research_2026-04-07.md)
+- [Video2LoRA Layer-To-Layer Notes (2026-04-08)](layer_to_layer_notes_2026-04-08.md)
 
 ## Goal
 Adapt Doc-to-LoRA so a small video-language model (VLM) can internalize a video and emit LoRA weights for a small base LM, using the same long-context perceiver-style aggregation strategy that the current project uses for document chunks.

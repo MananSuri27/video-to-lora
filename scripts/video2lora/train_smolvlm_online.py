@@ -73,6 +73,7 @@ class TrainArgs:
     max_frames: int
     questions_per_video: int
     frame_pooling: str
+    ctx_feature_mode: str
     kl_weight: float
     kl_temperature: float
     wandb_project: str
@@ -138,6 +139,11 @@ def parse_args() -> TrainArgs:
         default="mean",
         choices=("mean", "flatten"),
     )
+    parser.add_argument(
+        "--ctx-feature-mode",
+        default="visual_pooled",
+        choices=("visual_pooled", "l2l_fused_text"),
+    )
     parser.add_argument("--kl-weight", type=float, default=0.0)
     parser.add_argument("--kl-temperature", type=float, default=1.0)
     parser.add_argument("--wandb-project", default="video2lora-video-centric")
@@ -194,6 +200,7 @@ def parse_args() -> TrainArgs:
         max_frames=parsed.max_frames,
         questions_per_video=parsed.questions_per_video,
         frame_pooling=parsed.frame_pooling,
+        ctx_feature_mode=parsed.ctx_feature_mode,
         kl_weight=parsed.kl_weight,
         kl_temperature=parsed.kl_temperature,
         wandb_project=parsed.wandb_project,
@@ -492,7 +499,11 @@ def build_video2lora_model(args: TrainArgs, device: torch.device):
     )
     ctx_encoder_args = CtxEncoderArguments(
         ctx_encoder_model_name_or_path="precomputed",
-        ctx_encoder_type="early_exit",
+        ctx_encoder_type=(
+            "per_layer_activations"
+            if args.ctx_feature_mode == "l2l_fused_text"
+            else "early_exit"
+        ),
     )
     ctx_config = PretrainedConfig(hidden_size=ctx_hidden_size)
     hypernet_config = get_hypernet_config(
@@ -660,17 +671,78 @@ def extract_video_features(vlm, vlm_inputs, frame_pooling: str):
     return ctx_features, ctx_attn_mask, ctx_position_ids
 
 
+@torch.no_grad()
+def extract_l2l_fused_text_features(
+    vlm,
+    vlm_inputs,
+    num_target_layers: int,
+):
+    outputs = vlm.model(
+        input_ids=vlm_inputs.get("input_ids"),
+        attention_mask=vlm_inputs.get("attention_mask"),
+        pixel_values=vlm_inputs.get("pixel_values"),
+        pixel_attention_mask=vlm_inputs.get("pixel_attention_mask"),
+        output_hidden_states=True,
+        output_attentions=False,
+        use_cache=False,
+        return_dict=True,
+    )
+    hidden_states = outputs.hidden_states
+    if hidden_states is None:
+        raise ValueError("SmolVLM text model did not return hidden_states.")
+
+    # Match the existing Doc2LoRA l2l bias as closely as possible by using
+    # embeddings through the input of the last attention block when available.
+    if len(hidden_states) == num_target_layers + 1:
+        selected_hidden_states = hidden_states[:-1]
+    elif len(hidden_states) >= num_target_layers:
+        selected_hidden_states = hidden_states[-num_target_layers:]
+    else:
+        raise ValueError(
+            f"Need at least {num_target_layers} hidden-state tensors for layer-to-layer mode, "
+            f"but only received {len(hidden_states)}."
+        )
+
+    ctx_features = torch.stack(selected_hidden_states, dim=1)
+    ctx_attn_mask = vlm_inputs.get("attention_mask")
+    if ctx_attn_mask is None:
+        raise ValueError("Layer-to-layer mode requires attention_mask from SmolVLM inputs.")
+    return ctx_features, ctx_attn_mask, None
+
+
+def extract_context_features(
+    vlm,
+    vlm_inputs,
+    *,
+    ctx_feature_mode: str,
+    frame_pooling: str,
+    num_target_layers: int,
+):
+    if ctx_feature_mode == "visual_pooled":
+        return extract_video_features(vlm, vlm_inputs, frame_pooling=frame_pooling)
+    if ctx_feature_mode == "l2l_fused_text":
+        return extract_l2l_fused_text_features(
+            vlm,
+            vlm_inputs,
+            num_target_layers=num_target_layers,
+        )
+    raise ValueError(f"Unsupported ctx_feature_mode={ctx_feature_mode!r}")
+
+
 def repeat_video_features_per_question(
     ctx_features: torch.Tensor,
     ctx_attn_mask: torch.Tensor,
-    ctx_position_ids: torch.Tensor,
+    ctx_position_ids: torch.Tensor | None,
     question_counts: torch.Tensor,
 ):
     repeat_counts = question_counts.to(device=ctx_features.device, dtype=torch.long)
+    repeated_position_ids = None
+    if ctx_position_ids is not None:
+        repeated_position_ids = ctx_position_ids.repeat_interleave(repeat_counts, dim=0)
     return (
         ctx_features.repeat_interleave(repeat_counts, dim=0),
         ctx_attn_mask.repeat_interleave(repeat_counts, dim=0),
-        ctx_position_ids.repeat_interleave(repeat_counts, dim=0),
+        repeated_position_ids,
     )
 
 
@@ -768,6 +840,8 @@ def evaluate(
     data_loader: DataLoader,
     device: torch.device,
     frame_pooling: str,
+    ctx_feature_mode: str,
+    num_target_layers: int,
 ) -> dict[str, float]:
     model.eval()
     if device.type == "cuda":
@@ -787,10 +861,12 @@ def evaluate(
             video_fps=batch["video_fps"],
             max_frames=batch["max_frames"],
         )
-        ctx_features, ctx_attn_mask, ctx_position_ids = extract_video_features(
+        ctx_features, ctx_attn_mask, ctx_position_ids = extract_context_features(
             vlm,
             vlm_inputs,
+            ctx_feature_mode=ctx_feature_mode,
             frame_pooling=frame_pooling,
+            num_target_layers=num_target_layers,
         )
         ctx_features, ctx_attn_mask, ctx_position_ids = repeat_video_features_per_question(
             ctx_features,
@@ -839,6 +915,9 @@ def evaluate(
         "questions_per_video_mean": total_questions / max(total_videos, 1),
         "answer_tokens_per_question_mean": total_answer_tokens / max(total_questions, 1),
         "context_tokens_per_video_mean": total_context_tokens / max(total_videos, 1),
+        "context_layers_per_video_mean": float(num_target_layers)
+        if ctx_feature_mode == "l2l_fused_text"
+        else 1.0,
     }
     memory_metrics = get_peak_cuda_memory_metrics(device)
     if memory_metrics:
@@ -975,6 +1054,7 @@ def main():
         f"rank:{args.lora_r}",
         f"targets:{'-'.join(args.target_modules)}",
         f"qpv:{args.questions_per_video}",
+        f"ctx:{args.ctx_feature_mode}",
         f"pool:{args.frame_pooling}",
     ]
     wandb.init(
@@ -1025,6 +1105,9 @@ def main():
             f"{prefix}/context_tokens_per_video_mean": metrics.get(
                 "context_tokens_per_video_mean", 0.0
             ),
+            f"{prefix}/context_layers_per_video_mean": metrics.get(
+                "context_layers_per_video_mean", 0.0
+            ),
             f"{prefix}/memory_peak_allocated_gb": metrics.get("memory_peak_allocated_gb", 0.0),
             f"{prefix}/memory_peak_reserved_gb": metrics.get("memory_peak_reserved_gb", 0.0),
         }
@@ -1065,10 +1148,12 @@ def main():
                 max_frames=batch["max_frames"],
             )
             with torch.no_grad():
-                ctx_features, ctx_attn_mask, ctx_position_ids = extract_video_features(
+                ctx_features, ctx_attn_mask, ctx_position_ids = extract_context_features(
                     vlm,
                     vlm_inputs,
+                    ctx_feature_mode=args.ctx_feature_mode,
                     frame_pooling=args.frame_pooling,
+                    num_target_layers=model.hypernet.n_layers,
                 )
                 per_video_ctx_attn_mask = ctx_attn_mask
                 ctx_features, ctx_attn_mask, ctx_position_ids = repeat_video_features_per_question(
@@ -1161,6 +1246,9 @@ def main():
                     / max(accumulated_questions, 1),
                     "train/context_tokens_per_video_mean": accumulated_context_tokens
                     / max(accumulated_videos, 1),
+                    "train/context_layers_per_video_mean": float(model.hypernet.n_layers)
+                    if args.ctx_feature_mode == "l2l_fused_text"
+                    else 1.0,
                     "train/microbatches_per_optimizer_step": float(accumulated_microbatches),
                     "train/videos_per_optimizer_step": float(accumulated_videos),
                     "train/questions_per_optimizer_step": float(accumulated_questions),
@@ -1202,6 +1290,8 @@ def main():
                         val_loader,
                         device,
                         frame_pooling=args.frame_pooling,
+                        ctx_feature_mode=args.ctx_feature_mode,
+                        num_target_layers=model.hypernet.n_layers,
                     )
                     log_eval_metrics(metrics, step=global_step, prefix="val")
 
@@ -1245,6 +1335,8 @@ def main():
                     val_loader,
                     device,
                     frame_pooling=args.frame_pooling,
+                    ctx_feature_mode=args.ctx_feature_mode,
+                    num_target_layers=model.hypernet.n_layers,
                 )
                 log_eval_metrics(metrics, step=global_step, prefix="val")
 
@@ -1275,6 +1367,8 @@ def main():
             val_loader,
             device,
             frame_pooling=args.frame_pooling,
+            ctx_feature_mode=args.ctx_feature_mode,
+            num_target_layers=model.hypernet.n_layers,
         )
         log_eval_metrics(metrics, step=max(global_step, 1), prefix="val/final")
     wandb.finish()
